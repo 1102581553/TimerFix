@@ -4,7 +4,6 @@
 #include "ll/api/mod/RegisterHelper.h"
 
 #include "mc/util/Timer.h"
-#include <unordered_map>
 
 namespace timer_fix {
 
@@ -33,9 +32,6 @@ float inlineClamp(float v, float low, float high) {
     if (v <= low) return low;
     else return v;
 }
-
-// 存储每个 Timer 实例上一次记录的绝对时间（秒）
-std::unordered_map<Timer*, double> lastTimeSeconds_fixed;
 
 // ==================== Timer::advanceTime 钩子 ====================
 LL_AUTO_TYPE_INSTANCE_HOOK(
@@ -69,8 +65,8 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
             passedMsSysTime = 1;
             passedMs        = 1;   // 避免除零，同时保留真实流逝时间（尽管系统回调停滞）
         }
-        double adjustTimeT    = (double)passedMs / (double)passedMsSysTime;
-        this->mAdjustTime    += (adjustTimeT - this->mAdjustTime) * 0.2;
+        double adjustTimeT    = static_cast<double>(passedMs) / static_cast<double>(passedMsSysTime);
+        this->mAdjustTime    += static_cast<float>((adjustTimeT - this->mAdjustTime) * 0.2);
         this->mLastMs         = nowMs;
         this->mLastMsSysTime  = nowMs;
     }
@@ -81,10 +77,9 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
         this->mLastMsSysTime = nowMs;
     }
 
-    // 核心修改：基于独立映射计算本次应流逝的游戏时间
-    double passedSeconds =
-        (nowMs * 0.001 - lastTimeSeconds_fixed[this]) * this->mAdjustTime;
-    this->mLastTimeSeconds = lastTimeSeconds_fixed[this] = nowMs * 0.001;
+    // 关键修改：直接使用原版的 mLastTimeSeconds 作为上次时间基准
+    double passedSeconds = (nowMs * 0.001 - this->mLastTimeSeconds) * this->mAdjustTime;
+    this->mLastTimeSeconds = static_cast<float>(nowMs * 0.001);
 
     // ========== 修复溢出时间永久丢失问题 ==========
     // 将之前累积的溢出时间（以 tick 为单位）转换回秒，合并到本次时间步中
@@ -101,7 +96,7 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
     // 限制单次时间步不超过 0.1 秒，超出部分重新存入溢出
     if (passedSeconds > 0.1) {
         // 计算新的溢出（以 tick 为单位）
-        this->mOverflowTime += (passedSeconds - 0.1) * this->mTimeScale * this->mTicksPerSecond;
+        this->mOverflowTime += static_cast<float>((passedSeconds - 0.1) * this->mTimeScale * this->mTicksPerSecond);
         passedSeconds = 0.1;
     }
     // 确保非负
@@ -114,24 +109,6 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
     this->mPassedTime   -= static_cast<float>(this->mTicks);
     if (this->mTicks > 10) this->mTicks = 10;
     this->mAlpha = this->mPassedTime;
-}
-
-// ==================== Timer 析构钩子（防止内存泄漏）====================
-// 使用 $dtor 占位符钩取编译器生成的默认析构函数。
-// 若编译失败，请用实际修饰名替换，例如：
-//   LL_SYMBOL(??1Timer@@QEAA@XZ)   // 假设无虚函数
-//   LL_SYMBOL(??1Timer@@UEAA@XZ)   // 假设有虚函数
-LL_AUTO_TYPE_INSTANCE_HOOK(
-    TimerDestructorHook,
-    ll::memory::HookPriority::Normal,
-    Timer,
-    &Timer::$dtor,   // LeviLamina 内部可能支持 $dtor 占位符
-    void
-) {
-    // 在 Timer 对象销毁前，从全局映射中移除自身条目
-    lastTimeSeconds_fixed.erase(this);
-    // 调用原析构函数
-    origin();
 }
 
 } // namespace timer_fix
