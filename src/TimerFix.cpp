@@ -14,7 +14,6 @@
 namespace timer_fix {
 
 static Config config;
-static bool hookInstalled = false;
 static bool debugTaskRunning = false;
 
 // 调试统计（主线程独占）
@@ -37,8 +36,7 @@ Config& getConfig() { return config; }
 
 bool loadConfig() {
     auto path = TimerFix::getInstance().getSelf().getConfigDir() / "config.json";
-    bool loaded = ll::config::loadConfig(config, path);
-    return loaded;
+    return ll::config::loadConfig(config, path);
 }
 
 bool saveConfig() {
@@ -95,8 +93,8 @@ bool TimerFix::load() {
 }
 
 bool TimerFix::enable() {
-    getLogger().info("TimerFix enabled");
     if (config.debug) startDebugTask();
+    getLogger().info("TimerFix enabled");
     return true;
 }
 
@@ -122,7 +120,7 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
 
     ++totalCalls;
 
-    // 步进模式处理（与原版一致）
+    // 步进模式处理
     if (this->mSteppingTick >= 0) {
         ++steppingCalls;
         if (this->mSteppingTick) {
@@ -136,7 +134,7 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
     }
 
     // mGetTimeMSCallback 是 ll::TypedStorage 包装的 std::function<int64(void)>
-    // 必须通过 operator->() 获取底层 std::function 指针
+    // 通过 operator->() 获取底层 std::function 指针
     auto* callbackPtr = this->mGetTimeMSCallback.operator->();
     if (!callbackPtr || !(*callbackPtr)) {
         ++fallbackCalls;
@@ -149,14 +147,15 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
         return;
     }
 
-    // 回调返回 int64_t
-    int64_t nowMs    = (*callbackPtr)();
-    int64_t passedMs = nowMs - this->mLastMs;
+    // 回调返回 int64_t，成员是 int，需要显式转换
+    int64_t nowMs64  = (*callbackPtr)();
+    int nowMs        = static_cast<int>(nowMs64);
+    int passedMs     = nowMs - this->mLastMs;
 
-    // 长时间间隔（>1秒）处理：更新调整因子 mAdjustTime
+    // 长时间间隔（>1秒）处理
     if (passedMs > 1000) {
         ++longGaps;
-        int64_t passedMsSysTime = nowMs - this->mLastMsSysTime;
+        int passedMsSysTime = nowMs - this->mLastMsSysTime;
         if (passedMsSysTime <= 0) {
             passedMsSysTime = 1;
             passedMs        = 1;
@@ -169,18 +168,18 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
             this->mAdjustTime = 1.0f;
         }
 
-        this->mLastMs        = static_cast<int>(nowMs);
-        this->mLastMsSysTime = static_cast<int>(nowMs);
+        this->mLastMs        = nowMs;
+        this->mLastMsSysTime = nowMs;
     }
 
     // 时间回退处理
     if (passedMs < 0) {
         ++timeRollbacks;
-        this->mLastMs        = static_cast<int>(nowMs);
-        this->mLastMsSysTime = static_cast<int>(nowMs);
+        this->mLastMs        = nowMs;
+        this->mLastMsSysTime = nowMs;
     }
 
-    // 用 double 做中间计算，减少大数相减的精度丢失
+    // 用 double 做中间计算减少精度丢失
     double nowSeconds    = static_cast<double>(nowMs) * 0.001;
     double passedSeconds = (nowSeconds - static_cast<double>(this->mLastTimeSeconds))
                            * static_cast<double>(this->mAdjustTime);
@@ -199,3 +198,41 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
             this->mOverflowTime = 0.0f;
         } else {
             ++invalidFactorEvents;
+            static bool factorWarnedOnce = false;
+            if (!factorWarnedOnce) {
+                getLogger().warn("Invalid time factor: {}", factor);
+                factorWarnedOnce = true;
+            }
+        }
+    }
+
+    // 限制单步不超过 0.1 秒
+    if (passedSeconds > 0.1) {
+        ++overflowEvents;
+        double overflowTick = (passedSeconds - 0.1)
+                              * static_cast<double>(this->mTimeScale)
+                              * static_cast<double>(this->mTicksPerSecond);
+        if (std::isfinite(overflowTick)) {
+            this->mOverflowTime += static_cast<float>(overflowTick);
+        }
+        passedSeconds = 0.1;
+    }
+
+    this->mLastTimestep = static_cast<float>(passedSeconds);
+    this->mPassedTime  += static_cast<float>(passedSeconds
+                          * static_cast<double>(this->mTimeScale)
+                          * static_cast<double>(this->mTicksPerSecond));
+
+    if (!std::isfinite(this->mPassedTime) || this->mPassedTime < 0.0f) {
+        ++nanCorrections;
+        this->mPassedTime = 0.0f;
+    }
+
+    this->mTicks       = static_cast<int>(this->mPassedTime);
+    this->mPassedTime -= static_cast<float>(this->mTicks);
+    if (this->mTicks > 10) this->mTicks = 10;
+    this->mAlpha       = this->mPassedTime;
+}
+
+// ====================== 注册插件 ======================
+LL_REGISTER_MOD(timer_fix::TimerFix, timer_fix::TimerFix::getInstance());
